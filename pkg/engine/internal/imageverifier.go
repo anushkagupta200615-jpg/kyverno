@@ -40,6 +40,7 @@ type imageVerifier struct {
 	ivCache       imageverifycache.Client
 	policyContext engineapi.PolicyContext
 	rule          kyvernov1.Rule
+	origRule      kyvernov1.Rule
 	ivm           *engineapi.ImageVerificationMetadata
 }
 
@@ -50,13 +51,21 @@ func NewImageVerifier(
 	policyContext engineapi.PolicyContext,
 	rule kyvernov1.Rule,
 	ivm *engineapi.ImageVerificationMetadata,
+	origRule ...kyvernov1.Rule,
 ) ImageVerifier {
+	var orig kyvernov1.Rule
+	if len(origRule) > 0 {
+		orig = origRule[0]
+	} else {
+		orig = rule
+	}
 	return &imageVerifier{
 		logger:        logger,
 		rclient:       rclient,
 		ivCache:       ivCache,
 		policyContext: policyContext,
 		rule:          rule,
+		origRule:      orig,
 		ivm:           ivm,
 	}
 }
@@ -80,7 +89,7 @@ func (iv *imageVerifier) Verify(
 
 		pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
 		changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
-		if err == nil && !changed && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
+		if err == nil && !changed && imageVerify.UseCache && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
 			iv.logger.V(4).Info("no change in image, skipping check", "image", image)
 			iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
 			continue
@@ -763,6 +772,13 @@ func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface) {
 func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterface) interface{} {
 	switch v := data.(type) {
 	case string:
+		trimmed := strings.TrimSpace(v)
+		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") && !strings.Contains(trimmed[2:len(trimmed)-2], "{{") {
+			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			if res, err := ctx.Query(varName); err == nil && res != nil {
+				return res
+			}
+		}
 		return substituteContextVariablesInString(v, ctx)
 	case []interface{}:
 		res := make([]interface{}, len(v))
@@ -787,7 +803,13 @@ func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterf
 		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") {
 			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
 			if res, err := ctx.Query(varName); err == nil && res != nil {
-				return fmt.Sprintf("%v", res)
+				if b, err := json.Marshal(res); err == nil {
+					if str, ok := res.(string); ok {
+						return str
+					}
+					return string(b)
+				}
+				return fmt.Sprintf("%#v", res)
 			}
 		}
 		return s
@@ -858,17 +880,25 @@ func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
 	return false
 }
 
-func hasDynamicAuthority(rule *kyvernov1.Rule, imageVerify *kyvernov1.ImageVerification) bool {
-	if rule != nil && len(rule.Context) > 0 {
-		return true
-	}
-	if hasUnbindableKeyMaterial(imageVerify) {
-		return true
+func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.ImageVerification) bool {
+	if origRule != nil {
+		if len(origRule.Context) > 0 {
+			return true
+		}
+		if ruleBytes, err := json.Marshal(origRule); err == nil && strings.Contains(string(ruleBytes), "{{") {
+			return true
+		}
 	}
 	if rule != nil {
+		if len(rule.Context) > 0 {
+			return true
+		}
 		if ruleBytes, err := json.Marshal(rule); err == nil && strings.Contains(string(ruleBytes), "{{") {
 			return true
 		}
+	}
+	if hasUnbindableKeyMaterial(imageVerify) {
+		return true
 	}
 	if imageVerify != nil {
 		if ivBytes, err := json.Marshal(imageVerify); err == nil && strings.Contains(string(ivBytes), "{{") {
@@ -879,5 +909,5 @@ func hasDynamicAuthority(rule *kyvernov1.Rule, imageVerify *kyvernov1.ImageVerif
 }
 
 func (iv *imageVerifier) hasDynamicAuthority(imageVerify *kyvernov1.ImageVerification) bool {
-	return hasDynamicAuthority(&iv.rule, imageVerify)
+	return hasDynamicAuthority(&iv.origRule, &iv.rule, imageVerify)
 }
