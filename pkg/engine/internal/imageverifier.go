@@ -99,9 +99,9 @@ func (iv *imageVerifier) Verify(
 		if cacheRuleErr != nil {
 			iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
 		}
-		cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify)
+		cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify) && !hasUnresolvedConditionVariables(&imageVerify, iv.policyContext.JSONContext())
 		if cacheRuleErr == nil && !cacheable {
-			iv.logger.V(2).Info("caching disabled: attestor verifies with key material the cache rule cannot bind", "image", image)
+			iv.logger.V(2).Info("caching disabled: attestor verifies with key material or conditions the cache rule cannot bind", "image", image)
 		}
 
 		isInCache := false
@@ -883,6 +883,33 @@ func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
 	return false
 }
 
+func hasUnresolvedConditionVariables(imageVerify *kyvernov1.ImageVerification, jsonContext ...enginecontext.EvalInterface) bool {
+	if imageVerify == nil {
+		return false
+	}
+	ivCopy := imageVerify.DeepCopy()
+	if len(jsonContext) > 0 && jsonContext[0] != nil {
+		bindResolvedConditions(ivCopy, jsonContext[0])
+	}
+	for _, att := range ivCopy.Attestations {
+		if len(att.Conditions) > 0 {
+			if condBytes, err := json.Marshal(att.Conditions); err == nil {
+				if strings.Contains(string(condBytes), "{{") || strings.Contains(string(condBytes), "k8s://") {
+					return true
+				}
+			}
+		}
+	}
+	if ivCopy.Validation.Deny != nil && ivCopy.Validation.Deny.GetAnyAllConditions() != nil {
+		if condBytes, err := json.Marshal(ivCopy.Validation.Deny.GetAnyAllConditions()); err == nil {
+			if strings.Contains(string(condBytes), "{{") || strings.Contains(string(condBytes), "k8s://") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.ImageVerification) bool {
 	if origRule != nil {
 		if len(origRule.Context) > 0 {
@@ -900,7 +927,7 @@ func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.
 			return true
 		}
 	}
-	if hasUnbindableKeyMaterial(imageVerify) {
+	if hasUnbindableKeyMaterial(imageVerify) || hasUnresolvedConditionVariables(imageVerify) {
 		return true
 	}
 	if imageVerify != nil {

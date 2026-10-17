@@ -431,4 +431,96 @@ func Test_hasDynamicAuthority(t *testing.T) {
 		},
 	}
 	assert.True(t, hasDynamicAuthority(staticRule, staticRule, k8sSecretIV))
+
+	// 5. Attestation with unresolvable condition variables -> true (fast path bypassed)
+	unresolvedCondIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ builder.id }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"builder-A"`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, hasDynamicAuthority(staticRule, staticRule, unresolvedCondIV))
+}
+
+func Test_hasUnresolvedConditionVariables(t *testing.T) {
+	jp := jmespath.New(config.NewDefaultConfiguration(false))
+	ctx := enginecontext.NewContext(jp)
+	_ = ctx.AddVariable("cm.data.builder", "builder-A")
+
+	// 1. Condition with unresolvable statement variable -> true
+	unresolvedIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ builder.id }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"builder-A"`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, hasUnresolvedConditionVariables(unresolvedIV, ctx))
+
+	// 2. Condition with all variables resolved by context -> false
+	resolvedIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ cm.data.builder }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"builder-A"`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.False(t, hasUnresolvedConditionVariables(resolvedIV, ctx))
+
+	// 3. Attestation with no conditions -> false
+	noCondIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+			},
+		},
+	}
+	assert.False(t, hasUnresolvedConditionVariables(noCondIV, ctx))
+
+	// 4. Deny condition with unresolvable variable -> true
+	denyIV := &kyvernov1.ImageVerification{
+		Validation: kyvernov1.ValidateImageVerification{
+			Deny: &kyvernov1.Deny{},
+		},
+	}
+	denyIV.Validation.Deny.SetAnyAllConditions(map[string]interface{}{
+		"all": []interface{}{map[string]interface{}{
+			"key": "{{ scan.critical }}", "operator": "GreaterThan", "value": 0,
+		}},
+	})
+	assert.True(t, hasUnresolvedConditionVariables(denyIV, ctx))
 }
