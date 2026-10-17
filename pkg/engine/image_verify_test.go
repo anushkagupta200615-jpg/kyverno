@@ -1268,13 +1268,7 @@ func Test_changePolicyCacheVerificationCosign(t *testing.T) {
 	assert.Check(t, secondOperationTime > firstOperationTime/10 && secondOperationTime < firstOperationTime*10, "cache entry not found, so image verification should not be from cache.", firstOperationTime, secondOperationTime)
 }
 
-// Test_ImageVerifyCacheConfigMapRotation pins issue #17753: when an attestor's
-// public key is resolved from a variable referencing a ConfigMap and that
-// ConfigMap changes without any edit to the policy itself, the cache key must
-// change so that cached verification results produced under the old key are
-// invalidated immediately rather than served until TTL expiry.
-func Test_ImageVerifyCacheConfigMapRotation(t *testing.T) {
-	const configMapBackedPolicy = `{
+const configMapBackedPolicy = `{
 		"apiVersion": "kyverno.io/v1",
 		"kind": "ClusterPolicy",
 		"metadata": {
@@ -1338,6 +1332,12 @@ func Test_ImageVerifyCacheConfigMapRotation(t *testing.T) {
 		}
 	}`
 
+// Test_ImageVerifyCacheConfigMapRotation pins issue #17753: when an attestor's
+// public key is resolved from a variable referencing a ConfigMap and that
+// ConfigMap changes without any edit to the policy itself, the cache key must
+// change so that cached verification results produced under the old key are
+// invalidated immediately rather than served until TTL expiry.
+func Test_ImageVerifyCacheConfigMapRotation(t *testing.T) {
 	opts := []imageverifycache.Option{
 		imageverifycache.WithCacheEnableFlag(true),
 		imageverifycache.WithMaxSize(1000),
@@ -1388,6 +1388,71 @@ func Test_ImageVerifyCacheConfigMapRotation(t *testing.T) {
 	assert.Equal(t, imageVerifyCache.hits, 1, "verification after ConfigMap rotation must not serve stale cache hit")
 	assert.Equal(t, len(er.PolicyResponse.Rules), 1)
 	assert.Equal(t, er.PolicyResponse.Rules[0].Status(), engineapi.RuleStatusFail, "image must fail verification against rotated key")
+}
+
+// Test_ImageVerifyCacheConfigMapRotation_ResourceUpdate verifies that on resource update
+// admission requests, the annotation-based fast path is bypassed when the rule has dynamic
+// authority (e.g. ConfigMap key), ensuring that rotating the ConfigMap forces re-verification
+// even if the resource's image pointer did not change and oldResource carries the pass annotation.
+func Test_ImageVerifyCacheConfigMapRotation_ResourceUpdate(t *testing.T) {
+	opts := []imageverifycache.Option{
+		imageverifycache.WithCacheEnableFlag(true),
+		imageverifycache.WithMaxSize(1000),
+		imageverifycache.WithTTLDuration(24 * time.Hour),
+	}
+	inner, err := imageverifycache.New(opts...)
+	assert.NilError(t, err)
+	imageVerifyCache := &observedCache{Client: inner}
+
+	pinnedPolicy, pinnedResource, image := pinnedCacheFixture(configMapBackedPolicy, cosignTestResource)
+
+	// 1. Initial ConfigMap with the valid key.
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "attestor-keys",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8nXRh950IZbRj8Ra/N9sbqOPZrfM\n5/KAQN0/KjHcorm/J5yctVd7iEcnessRQjU917hmKO6JWVGHpDguIyakZA==\n-----END PUBLIC KEY-----",
+		},
+	}
+	fakeClient := kubefake.NewSimpleClientset(cm)
+	resolver, err := resolvers.NewClientBasedResolver(fakeClient)
+	assert.NilError(t, err)
+
+	// CREATE admission request.
+	policyContext := buildContext(t, pinnedPolicy, pinnedResource, "")
+	er, ivm := testImageVerifyCache(imageVerifyCache, context.TODO(), registryclient.New(), resolver, policyContext, cfg)
+	errorAssertionUtil(t, image, ivm, er)
+	assert.Equal(t, imageVerifyCache.stores, 1)
+
+	// 2. Prepare an UPDATE admission request where the existing object carries
+	// the image-verification annotation.
+	var oldResourceObj map[string]interface{}
+	err = json.Unmarshal([]byte(pinnedResource), &oldResourceObj)
+	assert.NilError(t, err)
+	metadata, ok := oldResourceObj["metadata"].(map[string]interface{})
+	assert.Assert(t, ok)
+	annotations := map[string]interface{}{
+		kyverno.AnnotationImageVerify:       `{"` + image + `":"pass"}`,
+		kyverno.AnnotationImageVerifyScoped: `{"version":1,"policies":{"check-image-cm":{"check-signature":{"` + image + `":"pass"}}}}`,
+	}
+	metadata["annotations"] = annotations
+	oldResourceBytes, err := json.Marshal(oldResourceObj)
+	assert.NilError(t, err)
+
+	// 3. Rotate the ConfigMap key.
+	cm.Data["key"] = testOtherKey
+	_, err = fakeClient.CoreV1().ConfigMaps("default").Update(context.TODO(), cm, metav1.UpdateOptions{})
+	assert.NilError(t, err)
+
+	// 4. Send an UPDATE admission request: image pointer has NOT changed.
+	// Because the rule has dynamic authority, the fast path is bypassed and re-verification against
+	// the new key is triggered. Since the image was signed with the old key, verification must fail.
+	updatePolicyContext := buildContext(t, pinnedPolicy, pinnedResource, string(oldResourceBytes))
+	erUpdate, _ := testImageVerifyCache(imageVerifyCache, context.TODO(), registryclient.New(), resolver, updatePolicyContext, cfg)
+	assert.Equal(t, len(erUpdate.PolicyResponse.Rules), 1)
+	assert.Equal(t, erUpdate.PolicyResponse.Rules[0].Status(), engineapi.RuleStatusFail, "resource update must fail verification against rotated key")
 }
 
 var verifyImageNotaryPolicy = `{

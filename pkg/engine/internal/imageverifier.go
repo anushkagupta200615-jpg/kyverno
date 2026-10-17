@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/go-logr/logr"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/config"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
+	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
 	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
 	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
@@ -25,6 +27,7 @@ import (
 	"github.com/kyverno/kyverno/pkg/validation/policy"
 	"go.uber.org/multierr"
 	"gomodules.xyz/jsonpatch/v2"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 type ImageVerifier interface {
@@ -77,13 +80,13 @@ func (iv *imageVerifier) Verify(
 
 		pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
 		changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
-		if err == nil && !changed && iv.isPreviouslyVerified(image) {
+		if err == nil && !changed && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
 			iv.logger.V(4).Info("no change in image, skipping check", "image", image)
 			iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
 			continue
 		}
 
-		cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify)
+		cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify, iv.policyContext.JSONContext())
 		if cacheRuleErr != nil {
 			iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
 		}
@@ -685,16 +688,19 @@ func (iv *imageVerifier) getDenyMessage(imageVerify kyvernov1.ImageVerification,
 }
 
 // attestorCacheRule builds a cache rule identifier from the rule name and the resolved
-// image verification authority. Attestors, public keys, and certificates are
-// resolved per request from variables (e.g. ConfigMaps), so keying on rule name
-// alone would serve a cached verdict produced under a previous key after the
+// image verification authority. Attestors, public keys, certificates, and attestation
+// condition variables are resolved per request from context (e.g. ConfigMaps), so keying
+// on rule name alone would serve a cached verdict produced under a previous key after the
 // ConfigMap is updated (issue #17753).
-func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification) (string, error) {
+func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification, jsonContext ...enginecontext.EvalInterface) (string, error) {
 	ivCopy := imageVerify.DeepCopy()
 	for i := range ivCopy.Attestations {
 		if ivCopy.Attestations[i].Type == "" && ivCopy.Attestations[i].PredicateType != "" {
 			ivCopy.Attestations[i].Type = ivCopy.Attestations[i].PredicateType
 		}
+	}
+	if len(jsonContext) > 0 && jsonContext[0] != nil {
+		bindResolvedConditions(ivCopy, jsonContext[0])
 	}
 	encoded, err := json.Marshal(ivCopy)
 	if err != nil {
@@ -704,9 +710,98 @@ func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification
 	return fmt.Sprintf("%s;%s", ruleName, hex.EncodeToString(sum[:])), nil
 }
 
+func bindResolvedConditions(iv *kyvernov1.ImageVerification, ctx enginecontext.EvalInterface) {
+	if iv == nil || ctx == nil {
+		return
+	}
+	for i := range iv.Attestations {
+		for j := range iv.Attestations[i].Conditions {
+			bindAnyAllConditions(&iv.Attestations[i].Conditions[j], ctx)
+		}
+	}
+	if iv.Validation.Deny != nil && iv.Validation.Deny.GetAnyAllConditions() != nil {
+		if condBytes, err := json.Marshal(iv.Validation.Deny.GetAnyAllConditions()); err == nil && len(condBytes) > 0 {
+			var denyObj interface{}
+			if err := json.Unmarshal(condBytes, &denyObj); err == nil {
+				newDenyObj := substituteContextVariables(denyObj, ctx)
+				iv.Validation.Deny.SetAnyAllConditions(newDenyObj)
+			}
+		}
+	}
+}
+
+func bindAnyAllConditions(cond *kyvernov1.AnyAllConditions, ctx enginecontext.EvalInterface) {
+	for k := range cond.AllConditions {
+		bindCondition(&cond.AllConditions[k], ctx)
+	}
+	for k := range cond.AnyConditions {
+		bindCondition(&cond.AnyConditions[k], ctx)
+	}
+}
+
+func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface) {
+	if c.RawKey != nil && len(c.RawKey.Raw) > 0 {
+		var keyObj interface{}
+		if err := json.Unmarshal(c.RawKey.Raw, &keyObj); err == nil {
+			newKey := substituteContextVariables(keyObj, ctx)
+			if newRaw, err := json.Marshal(newKey); err == nil {
+				c.RawKey = &apiextv1.JSON{Raw: newRaw}
+			}
+		}
+	}
+	if c.RawValue != nil && len(c.RawValue.Raw) > 0 {
+		var valObj interface{}
+		if err := json.Unmarshal(c.RawValue.Raw, &valObj); err == nil {
+			newVal := substituteContextVariables(valObj, ctx)
+			if newRaw, err := json.Marshal(newVal); err == nil {
+				c.RawValue = &apiextv1.JSON{Raw: newRaw}
+			}
+		}
+	}
+}
+
+func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterface) interface{} {
+	switch v := data.(type) {
+	case string:
+		return substituteContextVariablesInString(v, ctx)
+	case []interface{}:
+		res := make([]interface{}, len(v))
+		for i, item := range v {
+			res[i] = substituteContextVariables(item, ctx)
+		}
+		return res
+	case map[string]interface{}:
+		res := make(map[string]interface{}, len(v))
+		for k, val := range v {
+			res[k] = substituteContextVariables(val, ctx)
+		}
+		return res
+	default:
+		return data
+	}
+}
+
+func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterface) string {
+	return variables.ReplaceAllVars(val, func(s string) string {
+		trimmed := strings.TrimSpace(s)
+		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") {
+			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			if res, err := ctx.Query(varName); err == nil && res != nil {
+				return fmt.Sprintf("%v", res)
+			}
+		}
+		return s
+	})
+}
+
 func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
 	if attestor.Keys != nil {
 		if attestor.Keys.KMS != "" || attestor.Keys.Secret != nil {
+			return true
+		}
+		// publicKeys may contain a Kubernetes Secret reference or a KMS URI.
+		// Only inline PEM material is bound by the cache hash.
+		if pk := strings.TrimSpace(attestor.Keys.PublicKeys); pk != "" && !strings.Contains(pk, "PUBLIC KEY") {
 			return true
 		}
 	}
@@ -722,12 +817,19 @@ func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
 	return false
 }
 
+func attestationHasUnbindableMaterial(att kyvernov1.Attestation) bool {
+	if b, err := json.Marshal(att.Conditions); err == nil && strings.Contains(string(b), "k8s://") {
+		return true
+	}
+	return false
+}
+
 // hasUnbindableKeyMaterial reports whether any attestor verifies with key material
-// the cache rule cannot bind. A KMS url or a dynamic Secret reference names key
-// material that is fetched during verification, after the rule is derived, so
-// rotating what sits behind the KMS key or Secret leaves the rule unchanged and the
-// old verdict live. Inline and variable-derived keys are materialized before hashing
-// and so are bound.
+// the cache rule cannot bind. A KMS url or a dynamic Secret reference (either via
+// the structured Secret field or a "k8s://" URI in publicKeys) names key material
+// that is fetched during verification, after the rule is derived, so rotating what
+// sits behind the KMS key or Secret leaves the rule unchanged and the old verdict live.
+// Inline and variable-derived keys are materialized before hashing and so are bound.
 func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
 	for _, as := range imageVerify.Attestors {
 		for _, entry := range as.Entries {
@@ -744,6 +846,38 @@ func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
 				}
 			}
 		}
+		if attestationHasUnbindableMaterial(att) {
+			return true
+		}
+	}
+	if imageVerify.Validation.Deny != nil && imageVerify.Validation.Deny.GetAnyAllConditions() != nil {
+		if b, err := json.Marshal(imageVerify.Validation.Deny.GetAnyAllConditions()); err == nil && strings.Contains(string(b), "k8s://") {
+			return true
+		}
 	}
 	return false
+}
+
+func hasDynamicAuthority(rule *kyvernov1.Rule, imageVerify *kyvernov1.ImageVerification) bool {
+	if rule != nil && len(rule.Context) > 0 {
+		return true
+	}
+	if hasUnbindableKeyMaterial(imageVerify) {
+		return true
+	}
+	if rule != nil {
+		if ruleBytes, err := json.Marshal(rule); err == nil && strings.Contains(string(ruleBytes), "{{") {
+			return true
+		}
+	}
+	if imageVerify != nil {
+		if ivBytes, err := json.Marshal(imageVerify); err == nil && strings.Contains(string(ivBytes), "{{") {
+			return true
+		}
+	}
+	return false
+}
+
+func (iv *imageVerifier) hasDynamicAuthority(imageVerify *kyvernov1.ImageVerification) bool {
+	return hasDynamicAuthority(&iv.rule, imageVerify)
 }
