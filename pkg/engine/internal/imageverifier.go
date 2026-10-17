@@ -2,6 +2,9 @@ package internal
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -80,9 +83,18 @@ func (iv *imageVerifier) Verify(
 			continue
 		}
 
+		cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify)
+		if cacheRuleErr != nil {
+			iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
+		}
+		cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify)
+		if cacheRuleErr == nil && !cacheable {
+			iv.logger.V(2).Info("caching disabled: attestor verifies with key material the cache rule cannot bind", "image", image)
+		}
+
 		isInCache := false
-		if iv.ivCache != nil {
-			found, err := iv.ivCache.Get(ctx, iv.policyContext.Policy(), iv.rule.Name, image, imageVerify.UseCache)
+		if iv.ivCache != nil && cacheable {
+			found, err := iv.ivCache.Get(ctx, iv.policyContext.Policy(), cacheRule, image, imageVerify.UseCache)
 			if err != nil {
 				iv.logger.Error(err, "error occurred during cache get", "image", image)
 			} else {
@@ -100,8 +112,8 @@ func (iv *imageVerifier) Verify(
 			iv.logger.V(2).Info("cache entry not found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
 			ruleResp, digest = iv.verifyImage(ctx, imageVerify, imageInfo, cfg)
 			if ruleResp != nil && ruleResp.Status() == engineapi.RuleStatusPass {
-				if iv.ivCache != nil {
-					setted, err := iv.ivCache.Set(ctx, iv.policyContext.Policy(), iv.rule.Name, image, imageVerify.UseCache)
+				if iv.ivCache != nil && cacheable {
+					setted, err := iv.ivCache.Set(ctx, iv.policyContext.Policy(), cacheRule, image, imageVerify.UseCache)
 					if err != nil {
 						iv.logger.Error(err, "error occurred during cache set", "image", image)
 					} else {
@@ -673,4 +685,68 @@ func (iv *imageVerifier) getDenyMessage(imageVerify kyvernov1.ImageVerification,
 	default:
 		return "the produced message didn't resolve to a string, check your policy definition."
 	}
+}
+
+// attestorCacheRule builds a cache rule identifier from the rule name and the resolved
+// image verification authority. Attestors, public keys, and certificates are
+// resolved per request from variables (e.g. ConfigMaps), so keying on rule name
+// alone would serve a cached verdict produced under a previous key after the
+// ConfigMap is updated (issue #17753).
+func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification) (string, error) {
+	ivCopy := imageVerify.DeepCopy()
+	for i := range ivCopy.Attestations {
+		if ivCopy.Attestations[i].Type == "" && ivCopy.Attestations[i].PredicateType != "" {
+			ivCopy.Attestations[i].Type = ivCopy.Attestations[i].PredicateType
+		}
+	}
+	encoded, err := json.Marshal(ivCopy)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode image verification rule %q: %w", ruleName, err)
+	}
+	sum := sha256.Sum256(encoded)
+	return fmt.Sprintf("%s;%s", ruleName, hex.EncodeToString(sum[:])), nil
+}
+
+func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
+	if attestor.Keys != nil {
+		if attestor.Keys.KMS != "" || attestor.Keys.Secret != nil {
+			return true
+		}
+	}
+	if attestor.Attestor != nil && len(attestor.Attestor.Raw) > 0 {
+		if as, err := kyvernov1.AttestorSetUnmarshal(attestor.Attestor); err == nil && as != nil {
+			for _, entry := range as.Entries {
+				if attestorHasUnbindableKeyMaterial(entry) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hasUnbindableKeyMaterial reports whether any attestor verifies with key material
+// the cache rule cannot bind. A KMS url or a dynamic Secret reference names key
+// material that is fetched during verification, after the rule is derived, so
+// rotating what sits behind the KMS key or Secret leaves the rule unchanged and the
+// old verdict live. Inline and variable-derived keys are materialized before hashing
+// and so are bound.
+func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
+	for _, as := range imageVerify.Attestors {
+		for _, entry := range as.Entries {
+			if attestorHasUnbindableKeyMaterial(entry) {
+				return true
+			}
+		}
+	}
+	for _, att := range imageVerify.Attestations {
+		for _, as := range att.Attestors {
+			for _, entry := range as.Entries {
+				if attestorHasUnbindableKeyMaterial(entry) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

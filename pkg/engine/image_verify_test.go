@@ -28,6 +28,7 @@ import (
 	"github.com/kyverno/sdk/extensions/registryclient"
 	"gomodules.xyz/jsonpatch/v2"
 	"gotest.tools/v3/assert"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kubefake "k8s.io/client-go/kubernetes/fake"
@@ -1265,6 +1266,128 @@ func Test_changePolicyCacheVerificationCosign(t *testing.T) {
 	secondOperationTime := time.Since(start)
 	errorAssertionUtil(t, image, ivm, er)
 	assert.Check(t, secondOperationTime > firstOperationTime/10 && secondOperationTime < firstOperationTime*10, "cache entry not found, so image verification should not be from cache.", firstOperationTime, secondOperationTime)
+}
+
+// Test_ImageVerifyCacheConfigMapRotation pins issue #17753: when an attestor's
+// public key is resolved from a variable referencing a ConfigMap and that
+// ConfigMap changes without any edit to the policy itself, the cache key must
+// change so that cached verification results produced under the old key are
+// invalidated immediately rather than served until TTL expiry.
+func Test_ImageVerifyCacheConfigMapRotation(t *testing.T) {
+	const configMapBackedPolicy = `{
+		"apiVersion": "kyverno.io/v1",
+		"kind": "ClusterPolicy",
+		"metadata": {
+			"name": "check-image-cm",
+			"annotations": {
+				"pod-policies.kyverno.io/autogen-controllers": "none"
+			}
+		},
+		"spec": {
+			"validationFailureAction": "enforce",
+			"background": false,
+			"webhookTimeoutSeconds": 30,
+			"failurePolicy": "Fail",
+			"rules": [
+				{
+					"name": "check-signature",
+					"context": [
+						{
+							"name": "attestorkeys",
+							"configMap": {
+								"name": "attestor-keys",
+								"namespace": "default"
+							}
+						}
+					],
+					"match": {
+						"resources": {
+							"kinds": [
+								"Pod"
+							]
+						}
+					},
+					"verifyImages": [
+						{
+							"imageReferences": [
+								"ghcr.io/kyverno/test-verify-image*"
+							],
+							"useCache": true,
+							"attestors": [
+								{
+									"entries": [
+										{
+											"keys": {
+												"publicKeys": "{{ attestorkeys.data.key }}",
+												"rekor": {
+													"url": "https://rekor.sigstore.dev",
+													"ignoreTlog": true
+												},
+												"ctlog": {
+													"ignoreSCT": true
+												}
+											}
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			]
+		}
+	}`
+
+	opts := []imageverifycache.Option{
+		imageverifycache.WithCacheEnableFlag(true),
+		imageverifycache.WithMaxSize(1000),
+		imageverifycache.WithTTLDuration(24 * time.Hour),
+	}
+	inner, err := imageverifycache.New(opts...)
+	assert.NilError(t, err)
+	imageVerifyCache := &observedCache{Client: inner}
+
+	pinnedPolicy, pinnedResource, image := pinnedCacheFixture(configMapBackedPolicy, cosignTestResource)
+	policyContext := buildContext(t, pinnedPolicy, pinnedResource, "")
+
+	// 1. Seed ConfigMap with the valid signing key for test-verify-image:signed.
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "attestor-keys",
+			Namespace: "default",
+		},
+		Data: map[string]string{
+			"key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8nXRh950IZbRj8Ra/N9sbqOPZrfM\n5/KAQN0/KjHcorm/J5yctVd7iEcnessRQjU917hmKO6JWVGHpDguIyakZA==\n-----END PUBLIC KEY-----",
+		},
+	}
+	fakeClient := kubefake.NewSimpleClientset(cm)
+	resolver, err := resolvers.NewClientBasedResolver(fakeClient)
+	assert.NilError(t, err)
+
+	// First evaluation: cache miss, verified against key in ConfigMap, stored in cache.
+	er, ivm := testImageVerifyCache(imageVerifyCache, context.TODO(), registryclient.New(), resolver, policyContext, cfg)
+	errorAssertionUtil(t, image, ivm, er)
+	assert.Equal(t, imageVerifyCache.stores, 1, "first verification must store verdict in cache")
+	assert.Equal(t, imageVerifyCache.hits, 0, "first verification must miss cache")
+
+	// Second evaluation with identical ConfigMap: must be served from cache.
+	er, ivm = testImageVerifyCache(imageVerifyCache, context.TODO(), registryclient.New(), resolver, policyContext, cfg)
+	errorAssertionUtil(t, image, ivm, er)
+	assert.Equal(t, imageVerifyCache.hits, 1, "second verification must hit cache")
+
+	// 2. Rotate the public key in the ConfigMap to a different key.
+	// The policy object itself is NOT edited (UID and ResourceVersion are unchanged).
+	cm.Data["key"] = testOtherKey
+	_, err = fakeClient.CoreV1().ConfigMaps("default").Update(context.TODO(), cm, metav1.UpdateOptions{})
+	assert.NilError(t, err)
+
+	// Third evaluation: cache rule derived from resolved authority must NOT match old key.
+	// Must miss cache and re-verify against the new key. Since image was signed with the old
+	// key, verification against testOtherKey must fail.
+	er, _ = testImageVerifyCache(imageVerifyCache, context.TODO(), registryclient.New(), resolver, policyContext, cfg)
+	assert.Equal(t, imageVerifyCache.hits, 1, "verification after ConfigMap rotation must not serve stale cache hit")
+	assert.Equal(t, len(er.PolicyResponse.Rules), 1)
+	assert.Equal(t, er.PolicyResponse.Rules[0].Status(), engineapi.RuleStatusFail, "image must fail verification against rotated key")
 }
 
 var verifyImageNotaryPolicy = `{
