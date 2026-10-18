@@ -85,6 +85,14 @@ func (iv *imageVerifier) Verify(
 	imageVerify = *imageVerify.Convert()
 
 	for _, imageInfo := range matchedImageInfos {
+		image := imageInfo.String()
+		pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
+		changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
+		if err == nil && !changed && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
+			iv.logger.V(4).Info("no change in image, skipping check", "image", image)
+			iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
+			continue
+		}
 		p, r := iv.verifyMatchedImage(ctx, imageVerify, imageInfo, cfg)
 		patches = append(patches, p...)
 		responses = append(responses, r...)
@@ -108,7 +116,7 @@ func (iv *imageVerifier) verifyMatchedImage(
 
 	pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
 	changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
-	if err == nil && !changed && imageVerify.UseCache && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
+	if err == nil && !changed && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
 		iv.logger.V(4).Info("no change in image, skipping check", "image", image)
 		iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
 		return patches, responses
@@ -138,8 +146,24 @@ func (iv *imageVerifier) verifyMatchedImage(
 	var digest string
 	if isInCache {
 		iv.logger.V(2).Info("cache entry found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
-		ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache", iv.rule.ReportProperties)
 		digest = imageInfo.Digest
+		if iv.rule.HasValidateImageVerification() {
+			var validateErr error
+			for _, ivEntry := range iv.rule.VerifyImages {
+				if err := iv.validate(ivEntry, ctx); err != nil {
+					validateErr = err
+					break
+				}
+			}
+			if validateErr != nil {
+				msg := fmt.Sprintf("validation in verifyImages failed: %v", validateErr)
+				ruleResp = engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties)
+			} else {
+				ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache", iv.rule.ReportProperties)
+			}
+		} else {
+			ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache", iv.rule.ReportProperties)
+		}
 	} else {
 		iv.logger.V(2).Info("cache entry not found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
 		ruleResp, digest = iv.verifyImage(ctx, imageVerify, imageInfo, cfg)
@@ -739,6 +763,9 @@ func (iv *imageVerifier) getDenyMessage(imageVerify kyvernov1.ImageVerification,
 // on rule name alone would serve a cached verdict produced under a previous key after the
 // ConfigMap is updated (issue #17753).
 func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification, opts ...any) (string, error) {
+	if imageVerify == nil {
+		return "", errors.New("imageVerify cannot be nil")
+	}
 	ivCopy := imageVerify.DeepCopy()
 	for i := range ivCopy.Attestations {
 		if ivCopy.Attestations[i].Type == "" && ivCopy.Attestations[i].PredicateType != "" {
@@ -947,6 +974,9 @@ func attestationHasUnbindableMaterial(att kyvernov1.Attestation) bool {
 // sits behind the KMS key or Secret leaves the rule unchanged and the old verdict live.
 // Inline and variable-derived keys are materialized before hashing and so are bound.
 func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
+	if imageVerify == nil {
+		return false
+	}
 	for _, as := range imageVerify.Attestors {
 		for _, entry := range as.Entries {
 			if attestorHasUnbindableKeyMaterial(entry) {
@@ -1028,7 +1058,7 @@ func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.
 			return true
 		}
 	}
-	if hasUnbindableKeyMaterial(imageVerify) || hasUnresolvedConditionVariables(imageVerify) {
+	if imageVerify != nil && (hasUnbindableKeyMaterial(imageVerify) || hasUnresolvedConditionVariables(imageVerify)) {
 		return true
 	}
 	if imageVerify != nil {

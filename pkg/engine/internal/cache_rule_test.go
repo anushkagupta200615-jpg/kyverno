@@ -54,6 +54,10 @@ func Test_attestorCacheRule_BindsMaterialNotName(t *testing.T) {
 	ruleDifferentName, err := attestorCacheRule("other-rule", withKey("KEY-A"))
 	assert.NoError(t, err)
 	assert.NotEqual(t, ruleA, ruleDifferentName, "different rule names must produce different cache rules")
+
+	// Nil image verification must return an error and not panic
+	_, errNil := attestorCacheRule("verify-rule", nil)
+	assert.Error(t, errNil)
 }
 
 func Test_hasUnbindableKeyMaterial(t *testing.T) {
@@ -267,6 +271,11 @@ func Test_hasUnbindableKeyMaterial(t *testing.T) {
 				},
 			},
 			unbindable: true,
+		},
+		{
+			name:       "nil image verification",
+			iv:         nil,
+			unbindable: false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -514,6 +523,10 @@ func Test_hasDynamicAuthority(t *testing.T) {
 		},
 	}
 	assert.True(t, hasDynamicAuthority(staticRule, staticRule, refCondIV))
+
+	// 7. Nil image verification with static rule -> false (fast path eligible, nil safe)
+	assert.False(t, hasDynamicAuthority(staticRule, staticRule, nil))
+	assert.False(t, hasDynamicAuthority(nil, nil, nil))
 }
 
 func Test_hasUnresolvedConditionVariables(t *testing.T) {
@@ -1105,4 +1118,116 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8nXRh950IZbRj8Ra/N9sbqOPZrfM
 	assert.Equal(t, 1, fakeCacheDynamic.getCalled, "dynamic authority must bypass annotation fast path and consult cache")
 	assert.NotEmpty(t, responsesDynamic)
 	assert.Equal(t, engineapi.RuleStatusPass, responsesDynamic[0].Status())
+}
+
+func Test_ImageVerifier_CacheHitRetainsValidation(t *testing.T) {
+	cfg := config.NewDefaultConfiguration(false)
+	jp := jmespath.New(cfg)
+
+	res := unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata":   map[string]any{"name": "test-pod", "namespace": "default"},
+		},
+	}
+	policy := &kyvernov1.ClusterPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-policy",
+		},
+	}
+	policyCtx, err := policycontext.NewPolicyContext(jp, res, kyvernov1.Create, nil, cfg)
+	assert.NoError(t, err)
+	policyCtx = policyCtx.WithPolicy(policy)
+
+	imageInfo := apiutils.ImageInfo{
+		Registry: "docker.io",
+		Name:     "nginx",
+		Path:     "library/nginx",
+		Tag:      "latest",
+	}
+
+	const inlineKey = `-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8nXRh950IZbRj8Ra/N9sbqOPZrfM
+5/KAQN0/KjHcorm/J5yctVd7iEcnessRQjU917hmKO6JWVGHpDguIyakZA==
+-----END PUBLIC KEY-----`
+
+	ivEntry := kyvernov1.ImageVerification{
+		UseCache:        true,
+		ImageReferences: []string{"*"},
+		Attestors: []kyvernov1.AttestorSet{
+			{
+				Entries: []kyvernov1.Attestor{
+					{
+						Keys: &kyvernov1.StaticKeyAttestor{
+							PublicKeys: inlineKey,
+						},
+					},
+				},
+			},
+		},
+		Validation: kyvernov1.ValidateImageVerification{
+			Deny: &kyvernov1.Deny{},
+		},
+	}
+
+	// 1. Validation deny condition triggers: cache hit must return RuleFail
+	ivEntryFail := *ivEntry.DeepCopy()
+	ivEntryFail.Validation.Deny.SetAnyAllConditions(kyvernov1.AnyAllConditions{
+		AllConditions: []kyvernov1.Condition{
+			{
+				RawKey:   &apiextv1.JSON{Raw: []byte(`"true"`)},
+				Operator: kyvernov1.ConditionOperators["Equals"],
+				RawValue: &apiextv1.JSON{Raw: []byte(`"true"`)},
+			},
+		},
+	})
+	ruleFail := kyvernov1.Rule{
+		Name:         "test-rule",
+		VerifyImages: []kyvernov1.ImageVerification{ivEntryFail},
+	}
+	fakeCache := &recordingCacheClient{returnHit: true}
+	iv := &imageVerifier{
+		logger:        logr.Discard(),
+		rclient:       adapters.RegistryClient(registryclient.New()),
+		ivCache:       fakeCache,
+		policyContext: policyCtx,
+		rule:          ruleFail,
+		ivm:           &engineapi.ImageVerificationMetadata{},
+	}
+	_, responses := iv.verifyMatchedImage(context.Background(), ivEntryFail, imageInfo, cfg)
+	assert.Equal(t, 1, fakeCache.getCalled)
+	assert.NotEmpty(t, responses)
+	assert.Equal(t, engineapi.RuleStatusFail, responses[0].Status())
+	assert.Contains(t, responses[0].Message(), "validation in verifyImages failed")
+
+	// 2. Validation deny condition does not trigger: cache hit returns RulePass
+	ivEntryPass := *ivEntry.DeepCopy()
+	ivEntryPass.Validation.Deny.SetAnyAllConditions(kyvernov1.AnyAllConditions{
+		AllConditions: []kyvernov1.Condition{
+			{
+				RawKey:   &apiextv1.JSON{Raw: []byte(`"true"`)},
+				Operator: kyvernov1.ConditionOperators["Equals"],
+				RawValue: &apiextv1.JSON{Raw: []byte(`"false"`)},
+			},
+		},
+	})
+	rulePass := kyvernov1.Rule{
+		Name:         "test-rule",
+		VerifyImages: []kyvernov1.ImageVerification{ivEntryPass},
+	}
+	fakeCachePass := &recordingCacheClient{returnHit: true}
+	ivPass := &imageVerifier{
+		logger:        logr.Discard(),
+		rclient:       adapters.RegistryClient(registryclient.New()),
+		ivCache:       fakeCachePass,
+		policyContext: policyCtx,
+		rule:          rulePass,
+		ivm:           &engineapi.ImageVerificationMetadata{},
+	}
+	_, responsesPass := ivPass.verifyMatchedImage(context.Background(), ivEntryPass, imageInfo, cfg)
+	assert.Equal(t, 1, fakeCachePass.getCalled)
+	assert.NotEmpty(t, responsesPass)
+	assert.Equal(t, engineapi.RuleStatusPass, responsesPass[0].Status())
+	assert.Contains(t, responsesPass[0].Message(), "verified from cache")
 }
