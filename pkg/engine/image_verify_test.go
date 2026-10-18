@@ -1123,13 +1123,16 @@ func Test_ImageVerifyCacheCosign(t *testing.T) {
 // it, so a test can assert on hits and stores rather than on elapsed time.
 type observedCache struct {
 	imageverifycache.Client
-	gets   int
-	hits   int
-	stores int
+	gets        int
+	hits        int
+	stores      int
+	lastGetRule string
+	lastSetRule string
 }
 
 func (c *observedCache) Get(ctx context.Context, policy metav1.Object, ruleName string, imageRef string, useCache bool) (bool, error) {
 	c.gets++
+	c.lastGetRule = ruleName
 	found, err := c.Client.Get(ctx, policy, ruleName, imageRef, useCache)
 	if found {
 		c.hits++
@@ -1139,6 +1142,7 @@ func (c *observedCache) Get(ctx context.Context, policy metav1.Object, ruleName 
 
 func (c *observedCache) GetWithPayload(ctx context.Context, policy metav1.Object, ruleName string, imageRef string, useCache bool) (bool, map[string][]byte, error) {
 	c.gets++
+	c.lastGetRule = ruleName
 	found, payloads, err := c.Client.GetWithPayload(ctx, policy, ruleName, imageRef, useCache)
 	if found {
 		c.hits++
@@ -1147,6 +1151,7 @@ func (c *observedCache) GetWithPayload(ctx context.Context, policy metav1.Object
 }
 
 func (c *observedCache) Set(ctx context.Context, policy metav1.Object, ruleName string, imageRef string, useCache bool) (bool, error) {
+	c.lastSetRule = ruleName
 	stored, err := c.Client.Set(ctx, policy, ruleName, imageRef, useCache)
 	if stored {
 		c.stores++
@@ -1155,6 +1160,7 @@ func (c *observedCache) Set(ctx context.Context, policy metav1.Object, ruleName 
 }
 
 func (c *observedCache) SetWithPayload(ctx context.Context, policy metav1.Object, ruleName string, imageRef string, useCache bool, payloads map[string][]byte) (bool, error) {
+	c.lastSetRule = ruleName
 	stored, err := c.Client.SetWithPayload(ctx, policy, ruleName, imageRef, useCache, payloads)
 	if stored {
 		c.stores++
@@ -1369,11 +1375,15 @@ func Test_ImageVerifyCacheConfigMapRotation(t *testing.T) {
 	errorAssertionUtil(t, image, ivm, er)
 	assert.Equal(t, imageVerifyCache.stores, 1, "first verification must store verdict in cache")
 	assert.Equal(t, imageVerifyCache.hits, 0, "first verification must miss cache")
+	assert.Assert(t, strings.HasPrefix(imageVerifyCache.lastSetRule, "check-signature;"), "cache rule on set must start with rule name")
+	assert.Equal(t, len(imageVerifyCache.lastSetRule), len("check-signature;")+64, "cache rule on set must end with 64-char sha256 hash")
 
 	// Second evaluation with identical ConfigMap: must be served from cache.
 	er, ivm = testImageVerifyCache(imageVerifyCache, context.TODO(), registryclient.New(), resolver, policyContext, cfg)
 	errorAssertionUtil(t, image, ivm, er)
 	assert.Equal(t, imageVerifyCache.hits, 1, "second verification must hit cache")
+	assert.Assert(t, strings.HasPrefix(imageVerifyCache.lastGetRule, "check-signature;"), "cache rule on get must start with rule name")
+	assert.Equal(t, len(imageVerifyCache.lastGetRule), len("check-signature;")+64, "cache rule on get must end with 64-char sha256 hash")
 
 	// 2. Rotate the public key in the ConfigMap to a different key.
 	// The policy object itself is NOT edited (UID and ResourceVersion are unchanged).

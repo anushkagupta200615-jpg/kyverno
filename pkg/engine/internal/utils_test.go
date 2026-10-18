@@ -7,6 +7,7 @@ import (
 	"github.com/go-logr/logr"
 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
 	"github.com/kyverno/kyverno/pkg/config"
+	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
 	"github.com/kyverno/kyverno/pkg/engine/jmespath"
 	"github.com/kyverno/kyverno/pkg/engine/policycontext"
 	apiutils "github.com/kyverno/kyverno/pkg/utils/api"
@@ -547,4 +548,84 @@ func TestVerifyAttestationRejectsNonStringType(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read attestations for image")
 	assert.Contains(t, err.Error(), "found to be of the type float64")
+}
+
+func Test_EvaluateConditions_PredicateIsolation(t *testing.T) {
+	jp := jmespath.New(config.NewDefaultConfiguration(false))
+	ctx := enginecontext.NewContext(jp)
+	log := logr.Discard()
+
+	// 1. Statement A has onlyInA: "x"
+	stmtA := map[string]any{
+		"predicate": map[string]any{
+			"onlyInA": "x",
+		},
+	}
+	condA := []kyvernov1.AnyAllConditions{
+		{
+			AllConditions: []kyvernov1.Condition{
+				{
+					RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ onlyInA }}"`)},
+					Operator: kyvernov1.ConditionOperators["Equals"],
+					RawValue: &apiextv1.JSON{Raw: []byte(`"x"`)},
+				},
+			},
+		},
+	}
+	passA, _, err := EvaluateConditions(condA, ctx, stmtA, log)
+	assert.NoError(t, err)
+	assert.True(t, passA)
+
+	// 2. Statement B does not have onlyInA
+	stmtB := map[string]any{
+		"predicate": map[string]any{
+			"other": "y",
+		},
+	}
+	condB := []kyvernov1.AnyAllConditions{
+		{
+			AllConditions: []kyvernov1.Condition{
+				{
+					RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ onlyInA || '' }}"`)},
+					Operator: kyvernov1.ConditionOperators["Equals"],
+					RawValue: &apiextv1.JSON{Raw: []byte(`"x"`)},
+				},
+			},
+		},
+	}
+	passB, _, err := EvaluateConditions(condB, ctx, stmtB, log)
+	assert.NoError(t, err)
+	assert.False(t, passB, "statement B condition must not see onlyInA from statement A")
+
+	// 3. Parent context must not retain onlyInA
+	res, err := ctx.Query("onlyInA")
+	assert.True(t, err != nil || res == nil, "onlyInA must not remain in parent context")
+}
+
+func Test_EvaluateConditions_ErrorPathRestoresContext(t *testing.T) {
+	jp := jmespath.New(config.NewDefaultConfiguration(false))
+	ctx := enginecontext.NewContext(jp)
+	log := logr.Discard()
+
+	stmtErr := map[string]any{
+		"predicate": map[string]any{
+			"onlyInErr": "val",
+		},
+	}
+	condErr := []kyvernov1.AnyAllConditions{
+		{
+			AllConditions: []kyvernov1.Condition{
+				{
+					RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ 1 + }}"`)},
+					Operator: kyvernov1.ConditionOperators["Equals"],
+					RawValue: &apiextv1.JSON{Raw: []byte(`"x"`)},
+				},
+			},
+		},
+	}
+	_, _, err := EvaluateConditions(condErr, ctx, stmtErr, log)
+	assert.Error(t, err)
+
+	res, err := ctx.Query("onlyInErr")
+	assert.True(t, err != nil || res == nil, "deferred Restore must run and clear context on error path")
 }

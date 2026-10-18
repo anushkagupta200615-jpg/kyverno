@@ -15,14 +15,12 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
-	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
 	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
 	"github.com/kyverno/kyverno/pkg/image/verifiers"
 	"github.com/kyverno/kyverno/pkg/image/verifiers/cpol/cosign"
 	"github.com/kyverno/kyverno/pkg/image/verifiers/cpol/notary"
 	apiutils "github.com/kyverno/kyverno/pkg/utils/api"
-	"github.com/kyverno/kyverno/pkg/utils/jsonpointer"
 	stringutils "github.com/kyverno/kyverno/pkg/utils/strings"
 	"github.com/kyverno/kyverno/pkg/validation/policy"
 	"go.uber.org/multierr"
@@ -106,14 +104,6 @@ func (iv *imageVerifier) verifyMatchedImage(
 
 	image := imageInfo.String()
 
-	pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
-	changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
-	if err == nil && !changed && imageVerify.UseCache && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
-		iv.logger.V(4).Info("no change in image, skipping check", "image", image)
-		iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
-		return patches, responses
-	}
-
 	cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify, iv.policyContext.JSONContext())
 	if cacheRuleErr != nil {
 		iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
@@ -177,12 +167,6 @@ func (iv *imageVerifier) verifyMatchedImage(
 		responses = append(responses, ruleResp)
 	}
 	return patches, responses
-}
-
-func (iv *imageVerifier) isPreviouslyVerified(image string) bool {
-	policy := iv.policyContext.Policy()
-	status, err := engineutils.IsImageVerifiedForPolicy(iv.policyContext.OldResource(), policy.GetNamespace(), policy.GetName(), iv.rule.Name, image, iv.logger)
-	return err == nil && (status == engineapi.ImageVerificationPass || status == engineapi.ImageVerificationSkip)
 }
 
 func (iv *imageVerifier) addImageVerificationMetadata(image string, status engineapi.ImageVerificationMetadataStatus) {
@@ -769,7 +753,23 @@ func isStatementScopedVariable(varName string, statementNames map[string]bool) b
 			return true
 		}
 	}
-	return false
+	// ConfigMap references contain ".data." (e.g. cm.data.key).
+	if strings.Contains(v, ".data.") {
+		return false
+	}
+	root := v
+	if idx := strings.IndexAny(root, ".[("); idx != -1 {
+		root = root[:idx]
+	}
+	root = strings.TrimSpace(root)
+	switch root {
+	case "request", "serviceAccountName", "serviceAccountNamespace", "images", "image", "target", "element", "elementIndex":
+		return false
+	default:
+		// Any unqualified condition variable (e.g. "builder.id", "scanner.uri") reads fields directly
+		// from the statement's predicate map merged into the root context by EvaluateConditions.
+		return true
+	}
 }
 
 func bindResolvedConditions(iv *kyvernov1.ImageVerification, ctx enginecontext.EvalInterface) {
@@ -909,7 +909,7 @@ func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
 }
 
 func attestationHasUnbindableMaterial(att kyvernov1.Attestation) bool {
-	if b, err := json.Marshal(att.Conditions); err == nil && strings.Contains(string(b), "k8s://") {
+	if b, err := json.Marshal(att.Conditions); err == nil && (strings.Contains(string(b), "k8s://") || strings.Contains(string(b), "$(")) {
 		return true
 	}
 	return false
@@ -942,7 +942,7 @@ func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
 		}
 	}
 	if imageVerify.Validation.Deny != nil && imageVerify.Validation.Deny.GetAnyAllConditions() != nil {
-		if b, err := json.Marshal(imageVerify.Validation.Deny.GetAnyAllConditions()); err == nil && strings.Contains(string(b), "k8s://") {
+		if b, err := json.Marshal(imageVerify.Validation.Deny.GetAnyAllConditions()); err == nil && (strings.Contains(string(b), "k8s://") || strings.Contains(string(b), "$(")) {
 			return true
 		}
 	}
@@ -960,7 +960,7 @@ func hasUnresolvedConditionVariables(imageVerify *kyvernov1.ImageVerification, j
 	for _, att := range ivCopy.Attestations {
 		if len(att.Conditions) > 0 {
 			if condBytes, err := json.Marshal(att.Conditions); err == nil {
-				if strings.Contains(string(condBytes), "{{") || strings.Contains(string(condBytes), "k8s://") {
+				if strings.Contains(string(condBytes), "{{") || strings.Contains(string(condBytes), "$(") || strings.Contains(string(condBytes), "k8s://") {
 					return true
 				}
 			}
@@ -968,7 +968,7 @@ func hasUnresolvedConditionVariables(imageVerify *kyvernov1.ImageVerification, j
 	}
 	if ivCopy.Validation.Deny != nil && ivCopy.Validation.Deny.GetAnyAllConditions() != nil {
 		if condBytes, err := json.Marshal(ivCopy.Validation.Deny.GetAnyAllConditions()); err == nil {
-			if strings.Contains(string(condBytes), "{{") || strings.Contains(string(condBytes), "k8s://") {
+			if strings.Contains(string(condBytes), "{{") || strings.Contains(string(condBytes), "$(") || strings.Contains(string(condBytes), "k8s://") {
 				return true
 			}
 		}
@@ -981,7 +981,7 @@ func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.
 		if len(origRule.Context) > 0 {
 			return true
 		}
-		if ruleBytes, err := json.Marshal(origRule); err == nil && strings.Contains(string(ruleBytes), "{{") {
+		if ruleBytes, err := json.Marshal(origRule); err == nil && (strings.Contains(string(ruleBytes), "{{") || strings.Contains(string(ruleBytes), "$(")) {
 			return true
 		}
 	}
@@ -989,7 +989,7 @@ func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.
 		if len(rule.Context) > 0 {
 			return true
 		}
-		if ruleBytes, err := json.Marshal(rule); err == nil && strings.Contains(string(ruleBytes), "{{") {
+		if ruleBytes, err := json.Marshal(rule); err == nil && (strings.Contains(string(ruleBytes), "{{") || strings.Contains(string(ruleBytes), "$(")) {
 			return true
 		}
 	}
@@ -997,7 +997,7 @@ func hasDynamicAuthority(origRule, rule *kyvernov1.Rule, imageVerify *kyvernov1.
 		return true
 	}
 	if imageVerify != nil {
-		if ivBytes, err := json.Marshal(imageVerify); err == nil && strings.Contains(string(ivBytes), "{{") {
+		if ivBytes, err := json.Marshal(imageVerify); err == nil && (strings.Contains(string(ivBytes), "{{") || strings.Contains(string(ivBytes), "$(")) {
 			return true
 		}
 	}
