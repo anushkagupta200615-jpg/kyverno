@@ -240,6 +240,23 @@ func Test_hasUnbindableKeyMaterial(t *testing.T) {
 			},
 			unbindable: true,
 		},
+		{
+			name: "kms key in publicKeys containing PUBLIC KEY in name",
+			iv: &kyvernov1.ImageVerification{
+				Attestors: []kyvernov1.AttestorSet{
+					{
+						Entries: []kyvernov1.Attestor{
+							{
+								Keys: &kyvernov1.StaticKeyAttestor{
+									PublicKeys: "awskms:///alias/my-PUBLIC KEY-signing",
+								},
+							},
+						},
+					},
+				},
+			},
+			unbindable: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.unbindable, hasUnbindableKeyMaterial(tc.iv))
@@ -523,4 +540,93 @@ func Test_hasUnresolvedConditionVariables(t *testing.T) {
 		}},
 	})
 	assert.True(t, hasUnresolvedConditionVariables(denyIV, ctx))
+
+	// 5. Statement-scoped variables (predicate, @, named attestation) remain unresolved even if in context
+	ctxWithStatement := enginecontext.NewContext(jp)
+	_ = ctxWithStatement.AddVariable("predicate.builder.id", "builder-A")
+	_ = ctxWithStatement.AddVariable("scan.critical", 0)
+
+	predicateIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ predicate.builder.id }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"builder-A"`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, hasUnresolvedConditionVariables(predicateIV, ctxWithStatement))
+
+	namedAttIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				Name:          "scan",
+				PredicateType: "https://example.com/scan",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ scan.critical }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`0`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, hasUnresolvedConditionVariables(namedAttIV, ctxWithStatement))
+}
+
+func Test_attestorCacheRule_StatementScopedVariablesNotBound(t *testing.T) {
+	jp := jmespath.New(config.NewDefaultConfiguration(false))
+	ctxA := enginecontext.NewContext(jp)
+	_ = ctxA.AddVariable("predicate.builder.id", "builder-A")
+	_ = ctxA.AddVariable("scan.critical", 0)
+
+	ctxB := enginecontext.NewContext(jp)
+	_ = ctxB.AddVariable("predicate.builder.id", "builder-B")
+	_ = ctxB.AddVariable("scan.critical", 5)
+
+	iv := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				Name:          "scan",
+				PredicateType: "https://example.com/scan",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ predicate.builder.id }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"builder-A"`)},
+							},
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ scan.critical }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`0`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ruleA, err := attestorCacheRule("verify-rule", iv, ctxA)
+	assert.NoError(t, err)
+	ruleB, err := attestorCacheRule("verify-rule", iv, ctxB)
+	assert.NoError(t, err)
+
+	assert.Equal(t, ruleA, ruleB, "statement-scoped variables must not be bound from context into cache rule")
 }

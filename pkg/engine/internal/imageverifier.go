@@ -85,78 +85,96 @@ func (iv *imageVerifier) Verify(
 	imageVerify = *imageVerify.Convert()
 
 	for _, imageInfo := range matchedImageInfos {
-		image := imageInfo.String()
+		p, r := iv.verifyMatchedImage(ctx, imageVerify, imageInfo, cfg)
+		patches = append(patches, p...)
+		responses = append(responses, r...)
+	}
+	return patches, responses
+}
 
-		pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
-		changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
-		if err == nil && !changed && imageVerify.UseCache && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
-			iv.logger.V(4).Info("no change in image, skipping check", "image", image)
-			iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
-			continue
-		}
+func (iv *imageVerifier) verifyMatchedImage(
+	ctx context.Context,
+	imageVerify kyvernov1.ImageVerification,
+	imageInfo apiutils.ImageInfo,
+	cfg config.Configuration,
+) ([]jsonpatch.JsonPatchOperation, []*engineapi.RuleResponse) {
+	iv.policyContext.JSONContext().Checkpoint()
+	defer iv.policyContext.JSONContext().Restore()
 
-		cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify, iv.policyContext.JSONContext())
-		if cacheRuleErr != nil {
-			iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
-		}
-		cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify) && !hasUnresolvedConditionVariables(&imageVerify, iv.policyContext.JSONContext())
-		if cacheRuleErr == nil && !cacheable {
-			iv.logger.V(2).Info("caching disabled: attestor verifies with key material or conditions the cache rule cannot bind", "image", image)
-		}
+	var responses []*engineapi.RuleResponse
+	var patches []jsonpatch.JsonPatchOperation
 
-		isInCache := false
-		if iv.ivCache != nil && cacheable {
-			found, err := iv.ivCache.Get(ctx, iv.policyContext.Policy(), cacheRule, image, imageVerify.UseCache)
-			if err != nil {
-				iv.logger.Error(err, "error occurred during cache get", "image", image)
-			} else {
-				isInCache = found
-			}
-		}
+	image := imageInfo.String()
 
-		var ruleResp *engineapi.RuleResponse
-		var digest string
-		if isInCache {
-			iv.logger.V(2).Info("cache entry found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
-			ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache", iv.rule.ReportProperties)
-			digest = imageInfo.Digest
+	pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
+	changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
+	if err == nil && !changed && imageVerify.UseCache && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
+		iv.logger.V(4).Info("no change in image, skipping check", "image", image)
+		iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
+		return patches, responses
+	}
+
+	cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify, iv.policyContext.JSONContext())
+	if cacheRuleErr != nil {
+		iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
+	}
+	cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify) && !hasUnresolvedConditionVariables(&imageVerify, iv.policyContext.JSONContext())
+	if cacheRuleErr == nil && !cacheable {
+		iv.logger.V(2).Info("caching disabled: attestor verifies with key material or conditions the cache rule cannot bind", "image", image)
+	}
+
+	isInCache := false
+	if iv.ivCache != nil && cacheable {
+		found, err := iv.ivCache.Get(ctx, iv.policyContext.Policy(), cacheRule, image, imageVerify.UseCache)
+		if err != nil {
+			iv.logger.Error(err, "error occurred during cache get", "image", image)
 		} else {
-			iv.logger.V(2).Info("cache entry not found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
-			ruleResp, digest = iv.verifyImage(ctx, imageVerify, imageInfo, cfg)
-			if ruleResp != nil && ruleResp.Status() == engineapi.RuleStatusPass {
-				if iv.ivCache != nil && cacheable {
-					setted, err := iv.ivCache.Set(ctx, iv.policyContext.Policy(), cacheRule, image, imageVerify.UseCache)
-					if err != nil {
-						iv.logger.Error(err, "error occurred during cache set", "image", image)
-					} else {
-						if setted {
-							iv.logger.V(4).Info("successfully set cache", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
-						}
+			isInCache = found
+		}
+	}
+
+	var ruleResp *engineapi.RuleResponse
+	var digest string
+	if isInCache {
+		iv.logger.V(2).Info("cache entry found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
+		ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache", iv.rule.ReportProperties)
+		digest = imageInfo.Digest
+	} else {
+		iv.logger.V(2).Info("cache entry not found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
+		ruleResp, digest = iv.verifyImage(ctx, imageVerify, imageInfo, cfg)
+		if ruleResp != nil && ruleResp.Status() == engineapi.RuleStatusPass {
+			if iv.ivCache != nil && cacheable {
+				setted, err := iv.ivCache.Set(ctx, iv.policyContext.Policy(), cacheRule, image, imageVerify.UseCache)
+				if err != nil {
+					iv.logger.Error(err, "error occurred during cache set", "image", image)
+				} else {
+					if setted {
+						iv.logger.V(4).Info("successfully set cache", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
 					}
 				}
 			}
 		}
+	}
 
-		if imageVerify.MutateDigest {
-			patch, retrievedDigest, err := iv.handleMutateDigest(ctx, digest, imageInfo)
-			if err != nil {
-				responses = append(responses, engineapi.RuleError(iv.rule.Name, engineapi.ImageVerify, "failed to update digest", err, iv.rule.ReportProperties))
-			} else if patch != nil {
-				if ruleResp == nil {
-					ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "mutated image digest", iv.rule.ReportProperties)
-				}
-				patches = append(patches, *patch)
-				imageInfo.Digest = retrievedDigest
-				image = imageInfo.String()
+	if imageVerify.MutateDigest {
+		patch, retrievedDigest, err := iv.handleMutateDigest(ctx, digest, imageInfo)
+		if err != nil {
+			responses = append(responses, engineapi.RuleError(iv.rule.Name, engineapi.ImageVerify, "failed to update digest", err, iv.rule.ReportProperties))
+		} else if patch != nil {
+			if ruleResp == nil {
+				ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "mutated image digest", iv.rule.ReportProperties)
 			}
+			patches = append(patches, *patch)
+			imageInfo.Digest = retrievedDigest
+			image = imageInfo.String()
 		}
+	}
 
-		if ruleResp != nil {
-			if len(imageVerify.Attestors) > 0 || len(imageVerify.Attestations) > 0 {
-				iv.addImageVerificationMetadata(image, ruleStatusToImageVerificationStatus(ruleResp.Status()))
-			}
-			responses = append(responses, ruleResp)
+	if ruleResp != nil {
+		if len(imageVerify.Attestors) > 0 || len(imageVerify.Attestations) > 0 {
+			iv.addImageVerificationMetadata(image, ruleStatusToImageVerificationStatus(ruleResp.Status()))
 		}
+		responses = append(responses, ruleResp)
 	}
 	return patches, responses
 }
@@ -722,40 +740,73 @@ func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification
 	return fmt.Sprintf("%s;%s", ruleName, hex.EncodeToString(sum[:])), nil
 }
 
+func getAttestationStatementNames(iv *kyvernov1.ImageVerification) map[string]bool {
+	names := make(map[string]bool)
+	if iv == nil {
+		return names
+	}
+	for _, att := range iv.Attestations {
+		if att.Name != "" {
+			names[att.Name] = true
+		}
+	}
+	return names
+}
+
+func isStatementScopedVariable(varName string, statementNames map[string]bool) bool {
+	v := strings.TrimSpace(varName)
+	if v == "@" || strings.HasPrefix(v, "@.") || strings.HasPrefix(v, "@[") || strings.Contains(v, "(@") || strings.Contains(v, " @") {
+		return true
+	}
+	if v == "predicate" || strings.HasPrefix(v, "predicate.") || strings.HasPrefix(v, "predicate[") || strings.Contains(v, "predicate.") || strings.Contains(v, "predicate[") {
+		return true
+	}
+	for name := range statementNames {
+		if name == "" {
+			continue
+		}
+		if v == name || strings.HasPrefix(v, name+".") || strings.HasPrefix(v, name+"[") || strings.Contains(v, name+".") || strings.Contains(v, name+"[") {
+			return true
+		}
+	}
+	return false
+}
+
 func bindResolvedConditions(iv *kyvernov1.ImageVerification, ctx enginecontext.EvalInterface) {
 	if iv == nil || ctx == nil {
 		return
 	}
+	statementNames := getAttestationStatementNames(iv)
 	for i := range iv.Attestations {
 		for j := range iv.Attestations[i].Conditions {
-			bindAnyAllConditions(&iv.Attestations[i].Conditions[j], ctx)
+			bindAnyAllConditions(&iv.Attestations[i].Conditions[j], ctx, statementNames)
 		}
 	}
 	if iv.Validation.Deny != nil && iv.Validation.Deny.GetAnyAllConditions() != nil {
 		if condBytes, err := json.Marshal(iv.Validation.Deny.GetAnyAllConditions()); err == nil && len(condBytes) > 0 {
 			var denyObj interface{}
 			if err := json.Unmarshal(condBytes, &denyObj); err == nil {
-				newDenyObj := substituteContextVariables(denyObj, ctx)
+				newDenyObj := substituteContextVariables(denyObj, ctx, statementNames)
 				iv.Validation.Deny.SetAnyAllConditions(newDenyObj)
 			}
 		}
 	}
 }
 
-func bindAnyAllConditions(cond *kyvernov1.AnyAllConditions, ctx enginecontext.EvalInterface) {
+func bindAnyAllConditions(cond *kyvernov1.AnyAllConditions, ctx enginecontext.EvalInterface, statementNames map[string]bool) {
 	for k := range cond.AllConditions {
-		bindCondition(&cond.AllConditions[k], ctx)
+		bindCondition(&cond.AllConditions[k], ctx, statementNames)
 	}
 	for k := range cond.AnyConditions {
-		bindCondition(&cond.AnyConditions[k], ctx)
+		bindCondition(&cond.AnyConditions[k], ctx, statementNames)
 	}
 }
 
-func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface) {
+func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface, statementNames map[string]bool) {
 	if c.RawKey != nil && len(c.RawKey.Raw) > 0 {
 		var keyObj interface{}
 		if err := json.Unmarshal(c.RawKey.Raw, &keyObj); err == nil {
-			newKey := substituteContextVariables(keyObj, ctx)
+			newKey := substituteContextVariables(keyObj, ctx, statementNames)
 			if newRaw, err := json.Marshal(newKey); err == nil {
 				c.RawKey = &apiextv1.JSON{Raw: newRaw}
 			}
@@ -764,7 +815,7 @@ func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface) {
 	if c.RawValue != nil && len(c.RawValue.Raw) > 0 {
 		var valObj interface{}
 		if err := json.Unmarshal(c.RawValue.Raw, &valObj); err == nil {
-			newVal := substituteContextVariables(valObj, ctx)
+			newVal := substituteContextVariables(valObj, ctx, statementNames)
 			if newRaw, err := json.Marshal(newVal); err == nil {
 				c.RawValue = &apiextv1.JSON{Raw: newRaw}
 			}
@@ -772,27 +823,31 @@ func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface) {
 	}
 }
 
-func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterface) interface{} {
+func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterface, statementNames ...map[string]bool) interface{} {
+	names := getStatementNames(statementNames...)
 	switch v := data.(type) {
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") && !strings.Contains(trimmed[2:len(trimmed)-2], "{{") {
 			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			if isStatementScopedVariable(varName, names) {
+				return v
+			}
 			if res, err := ctx.Query(varName); err == nil && res != nil {
 				return res
 			}
 		}
-		return substituteContextVariablesInString(v, ctx)
+		return substituteContextVariablesInString(v, ctx, statementNames...)
 	case []interface{}:
 		res := make([]interface{}, len(v))
 		for i, item := range v {
-			res[i] = substituteContextVariables(item, ctx)
+			res[i] = substituteContextVariables(item, ctx, statementNames...)
 		}
 		return res
 	case map[string]interface{}:
 		res := make(map[string]interface{}, len(v))
 		for k, val := range v {
-			res[k] = substituteContextVariables(val, ctx)
+			res[k] = substituteContextVariables(val, ctx, statementNames...)
 		}
 		return res
 	default:
@@ -800,11 +855,15 @@ func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterfac
 	}
 }
 
-func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterface) string {
+func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterface, statementNames ...map[string]bool) string {
+	names := getStatementNames(statementNames...)
 	return variables.ReplaceAllVars(val, func(s string) string {
 		trimmed := strings.TrimSpace(s)
 		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") {
 			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+			if isStatementScopedVariable(varName, names) {
+				return s
+			}
 			if res, err := ctx.Query(varName); err == nil && res != nil {
 				if b, err := json.Marshal(res); err == nil {
 					if str, ok := res.(string); ok {
@@ -819,6 +878,13 @@ func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterf
 	})
 }
 
+func getStatementNames(statementNames ...map[string]bool) map[string]bool {
+	if len(statementNames) > 0 && statementNames[0] != nil {
+		return statementNames[0]
+	}
+	return nil
+}
+
 func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
 	if attestor.Keys != nil {
 		if attestor.Keys.KMS != "" || attestor.Keys.Secret != nil {
@@ -826,7 +892,7 @@ func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
 		}
 		// publicKeys may contain a Kubernetes Secret reference or a KMS URI.
 		// Only inline PEM material is bound by the cache hash.
-		if pk := strings.TrimSpace(attestor.Keys.PublicKeys); pk != "" && !strings.Contains(pk, "PUBLIC KEY") {
+		if pk := strings.TrimSpace(attestor.Keys.PublicKeys); pk != "" && !strings.HasPrefix(pk, "-----BEGIN PUBLIC KEY-----") {
 			return true
 		}
 	}
