@@ -15,12 +15,14 @@ import (
 	"github.com/kyverno/kyverno/pkg/config"
 	engineapi "github.com/kyverno/kyverno/pkg/engine/api"
 	enginecontext "github.com/kyverno/kyverno/pkg/engine/context"
+	engineutils "github.com/kyverno/kyverno/pkg/engine/utils"
 	"github.com/kyverno/kyverno/pkg/engine/variables"
 	imageverifycache "github.com/kyverno/kyverno/pkg/image/verification/cache"
 	"github.com/kyverno/kyverno/pkg/image/verifiers"
 	"github.com/kyverno/kyverno/pkg/image/verifiers/cpol/cosign"
 	"github.com/kyverno/kyverno/pkg/image/verifiers/cpol/notary"
 	apiutils "github.com/kyverno/kyverno/pkg/utils/api"
+	"github.com/kyverno/kyverno/pkg/utils/jsonpointer"
 	stringutils "github.com/kyverno/kyverno/pkg/utils/strings"
 	"github.com/kyverno/kyverno/pkg/validation/policy"
 	"go.uber.org/multierr"
@@ -104,11 +106,20 @@ func (iv *imageVerifier) verifyMatchedImage(
 
 	image := imageInfo.String()
 
-	cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify, iv.policyContext.JSONContext())
+	pointer := jsonpointer.ParsePath(imageInfo.Pointer).JMESPath()
+	changed, err := iv.policyContext.JSONContext().HasChanged(pointer)
+	if err == nil && !changed && imageVerify.UseCache && !iv.hasDynamicAuthority(&imageVerify) && iv.isPreviouslyVerified(image) {
+		iv.logger.V(4).Info("no change in image, skipping check", "image", image)
+		iv.addImageVerificationMetadata(image, engineapi.ImageVerificationPass)
+		return patches, responses
+	}
+
+	declaredContextNames := iv.getDeclaredContextNames()
+	cacheRule, cacheRuleErr := attestorCacheRule(iv.rule.Name, &imageVerify, iv.policyContext.JSONContext(), declaredContextNames)
 	if cacheRuleErr != nil {
 		iv.logger.Error(cacheRuleErr, "caching disabled: failed to derive cache rule", "image", image)
 	}
-	cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify) && !hasUnresolvedConditionVariables(&imageVerify, iv.policyContext.JSONContext())
+	cacheable := cacheRuleErr == nil && !hasUnbindableKeyMaterial(&imageVerify) && !hasUnresolvedConditionVariables(&imageVerify, iv.policyContext.JSONContext(), declaredContextNames)
 	if cacheRuleErr == nil && !cacheable {
 		iv.logger.V(2).Info("caching disabled: attestor verifies with key material or conditions the cache rule cannot bind", "image", image)
 	}
@@ -173,6 +184,27 @@ func (iv *imageVerifier) addImageVerificationMetadata(image string, status engin
 	policy := iv.policyContext.Policy()
 	iv.ivm.Add(image, status)
 	iv.ivm.AddScoped(policy.GetNamespace(), policy.GetName(), iv.rule.Name, image, status)
+}
+
+func (iv *imageVerifier) isPreviouslyVerified(image string) bool {
+	policy := iv.policyContext.Policy()
+	status, err := engineutils.IsImageVerifiedForPolicy(iv.policyContext.OldResource(), policy.GetNamespace(), policy.GetName(), iv.rule.Name, image, iv.logger)
+	return err == nil && (status == engineapi.ImageVerificationPass || status == engineapi.ImageVerificationSkip)
+}
+
+func (iv *imageVerifier) getDeclaredContextNames() map[string]bool {
+	names := make(map[string]bool)
+	for _, ce := range iv.origRule.Context {
+		if ce.Name != "" {
+			names[ce.Name] = true
+		}
+	}
+	for _, ce := range iv.rule.Context {
+		if ce.Name != "" {
+			names[ce.Name] = true
+		}
+	}
+	return names
 }
 
 func (iv *imageVerifier) verifyImage(
@@ -706,15 +738,25 @@ func (iv *imageVerifier) getDenyMessage(imageVerify kyvernov1.ImageVerification,
 // condition variables are resolved per request from context (e.g. ConfigMaps), so keying
 // on rule name alone would serve a cached verdict produced under a previous key after the
 // ConfigMap is updated (issue #17753).
-func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification, jsonContext ...enginecontext.EvalInterface) (string, error) {
+func attestorCacheRule(ruleName string, imageVerify *kyvernov1.ImageVerification, opts ...any) (string, error) {
 	ivCopy := imageVerify.DeepCopy()
 	for i := range ivCopy.Attestations {
 		if ivCopy.Attestations[i].Type == "" && ivCopy.Attestations[i].PredicateType != "" {
 			ivCopy.Attestations[i].Type = ivCopy.Attestations[i].PredicateType
 		}
 	}
-	if len(jsonContext) > 0 && jsonContext[0] != nil {
-		bindResolvedConditions(ivCopy, jsonContext[0])
+	var evalCtx enginecontext.EvalInterface
+	var declaredNames map[string]bool
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case enginecontext.EvalInterface:
+			evalCtx = v
+		case map[string]bool:
+			declaredNames = v
+		}
+	}
+	if evalCtx != nil {
+		bindResolvedConditions(ivCopy, evalCtx, declaredNames)
 	}
 	encoded, err := json.Marshal(ivCopy)
 	if err != nil {
@@ -737,7 +779,7 @@ func getAttestationStatementNames(iv *kyvernov1.ImageVerification) map[string]bo
 	return names
 }
 
-func isStatementScopedVariable(varName string, statementNames map[string]bool) bool {
+func isStatementScopedVariable(varName string, statementNames map[string]bool, declaredContextNames map[string]bool) bool {
 	v := strings.TrimSpace(varName)
 	if v == "@" || strings.HasPrefix(v, "@.") || strings.HasPrefix(v, "@[") || strings.Contains(v, "(@") || strings.Contains(v, " @") {
 		return true
@@ -753,60 +795,52 @@ func isStatementScopedVariable(varName string, statementNames map[string]bool) b
 			return true
 		}
 	}
-	// ConfigMap references contain ".data." (e.g. cm.data.key).
-	if strings.Contains(v, ".data.") {
-		return false
-	}
 	root := v
 	if idx := strings.IndexAny(root, ".[("); idx != -1 {
 		root = root[:idx]
 	}
 	root = strings.TrimSpace(root)
-	switch root {
-	case "request", "serviceAccountName", "serviceAccountNamespace", "images", "image", "target", "element", "elementIndex":
+	if declaredContextNames != nil && declaredContextNames[root] {
 		return false
-	default:
-		// Any unqualified condition variable (e.g. "builder.id", "scanner.uri") reads fields directly
-		// from the statement's predicate map merged into the root context by EvaluateConditions.
-		return true
 	}
+	return true
 }
 
-func bindResolvedConditions(iv *kyvernov1.ImageVerification, ctx enginecontext.EvalInterface) {
+func bindResolvedConditions(iv *kyvernov1.ImageVerification, ctx enginecontext.EvalInterface, declaredNames map[string]bool) {
 	if iv == nil || ctx == nil {
 		return
 	}
 	statementNames := getAttestationStatementNames(iv)
 	for i := range iv.Attestations {
 		for j := range iv.Attestations[i].Conditions {
-			bindAnyAllConditions(&iv.Attestations[i].Conditions[j], ctx, statementNames)
+			bindAnyAllConditions(&iv.Attestations[i].Conditions[j], ctx, statementNames, declaredNames)
 		}
 	}
 	if iv.Validation.Deny != nil && iv.Validation.Deny.GetAnyAllConditions() != nil {
 		if condBytes, err := json.Marshal(iv.Validation.Deny.GetAnyAllConditions()); err == nil && len(condBytes) > 0 {
 			var denyObj interface{}
 			if err := json.Unmarshal(condBytes, &denyObj); err == nil {
-				newDenyObj := substituteContextVariables(denyObj, ctx, statementNames)
+				newDenyObj := substituteContextVariables(denyObj, ctx, statementNames, declaredNames)
 				iv.Validation.Deny.SetAnyAllConditions(newDenyObj)
 			}
 		}
 	}
 }
 
-func bindAnyAllConditions(cond *kyvernov1.AnyAllConditions, ctx enginecontext.EvalInterface, statementNames map[string]bool) {
+func bindAnyAllConditions(cond *kyvernov1.AnyAllConditions, ctx enginecontext.EvalInterface, statementNames map[string]bool, declaredNames map[string]bool) {
 	for k := range cond.AllConditions {
-		bindCondition(&cond.AllConditions[k], ctx, statementNames)
+		bindCondition(&cond.AllConditions[k], ctx, statementNames, declaredNames)
 	}
 	for k := range cond.AnyConditions {
-		bindCondition(&cond.AnyConditions[k], ctx, statementNames)
+		bindCondition(&cond.AnyConditions[k], ctx, statementNames, declaredNames)
 	}
 }
 
-func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface, statementNames map[string]bool) {
+func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface, statementNames map[string]bool, declaredNames map[string]bool) {
 	if c.RawKey != nil && len(c.RawKey.Raw) > 0 {
 		var keyObj interface{}
 		if err := json.Unmarshal(c.RawKey.Raw, &keyObj); err == nil {
-			newKey := substituteContextVariables(keyObj, ctx, statementNames)
+			newKey := substituteContextVariables(keyObj, ctx, statementNames, declaredNames)
 			if newRaw, err := json.Marshal(newKey); err == nil {
 				c.RawKey = &apiextv1.JSON{Raw: newRaw}
 			}
@@ -815,7 +849,7 @@ func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface, stat
 	if c.RawValue != nil && len(c.RawValue.Raw) > 0 {
 		var valObj interface{}
 		if err := json.Unmarshal(c.RawValue.Raw, &valObj); err == nil {
-			newVal := substituteContextVariables(valObj, ctx, statementNames)
+			newVal := substituteContextVariables(valObj, ctx, statementNames, declaredNames)
 			if newRaw, err := json.Marshal(newVal); err == nil {
 				c.RawValue = &apiextv1.JSON{Raw: newRaw}
 			}
@@ -823,31 +857,30 @@ func bindCondition(c *kyvernov1.Condition, ctx enginecontext.EvalInterface, stat
 	}
 }
 
-func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterface, statementNames ...map[string]bool) interface{} {
-	names := getStatementNames(statementNames...)
+func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterface, statementNames map[string]bool, declaredNames map[string]bool) interface{} {
 	switch v := data.(type) {
 	case string:
 		trimmed := strings.TrimSpace(v)
 		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") && !strings.Contains(trimmed[2:len(trimmed)-2], "{{") {
 			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
-			if isStatementScopedVariable(varName, names) {
+			if isStatementScopedVariable(varName, statementNames, declaredNames) {
 				return v
 			}
 			if res, err := ctx.Query(varName); err == nil && res != nil {
 				return res
 			}
 		}
-		return substituteContextVariablesInString(v, ctx, statementNames...)
+		return substituteContextVariablesInString(v, ctx, statementNames, declaredNames)
 	case []interface{}:
 		res := make([]interface{}, len(v))
 		for i, item := range v {
-			res[i] = substituteContextVariables(item, ctx, statementNames...)
+			res[i] = substituteContextVariables(item, ctx, statementNames, declaredNames)
 		}
 		return res
 	case map[string]interface{}:
 		res := make(map[string]interface{}, len(v))
 		for k, val := range v {
-			res[k] = substituteContextVariables(val, ctx, statementNames...)
+			res[k] = substituteContextVariables(val, ctx, statementNames, declaredNames)
 		}
 		return res
 	default:
@@ -855,13 +888,12 @@ func substituteContextVariables(data interface{}, ctx enginecontext.EvalInterfac
 	}
 }
 
-func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterface, statementNames ...map[string]bool) string {
-	names := getStatementNames(statementNames...)
+func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterface, statementNames map[string]bool, declaredNames map[string]bool) string {
 	return variables.ReplaceAllVars(val, func(s string) string {
 		trimmed := strings.TrimSpace(s)
 		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") {
 			varName := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
-			if isStatementScopedVariable(varName, names) {
+			if isStatementScopedVariable(varName, statementNames, declaredNames) {
 				return s
 			}
 			if res, err := ctx.Query(varName); err == nil && res != nil {
@@ -876,13 +908,6 @@ func substituteContextVariablesInString(val string, ctx enginecontext.EvalInterf
 		}
 		return s
 	})
-}
-
-func getStatementNames(statementNames ...map[string]bool) map[string]bool {
-	if len(statementNames) > 0 && statementNames[0] != nil {
-		return statementNames[0]
-	}
-	return nil
 }
 
 func attestorHasUnbindableKeyMaterial(attestor kyvernov1.Attestor) bool {
@@ -949,13 +974,23 @@ func hasUnbindableKeyMaterial(imageVerify *kyvernov1.ImageVerification) bool {
 	return false
 }
 
-func hasUnresolvedConditionVariables(imageVerify *kyvernov1.ImageVerification, jsonContext ...enginecontext.EvalInterface) bool {
+func hasUnresolvedConditionVariables(imageVerify *kyvernov1.ImageVerification, opts ...any) bool {
 	if imageVerify == nil {
 		return false
 	}
+	var evalCtx enginecontext.EvalInterface
+	var declaredNames map[string]bool
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case enginecontext.EvalInterface:
+			evalCtx = v
+		case map[string]bool:
+			declaredNames = v
+		}
+	}
 	ivCopy := imageVerify.DeepCopy()
-	if len(jsonContext) > 0 && jsonContext[0] != nil {
-		bindResolvedConditions(ivCopy, jsonContext[0])
+	if evalCtx != nil {
+		bindResolvedConditions(ivCopy, evalCtx, declaredNames)
 	}
 	for _, att := range ivCopy.Attestations {
 		if len(att.Conditions) > 0 {

@@ -302,18 +302,19 @@ func Test_attestorCacheRule_BindsConditionVariables(t *testing.T) {
 		},
 	}
 
-	ruleA, err := attestorCacheRule("verify-rule", iv, newCtx("builder-A"))
+	declared := map[string]bool{"cm": true}
+	ruleA, err := attestorCacheRule("verify-rule", iv, newCtx("builder-A"), declared)
 	assert.NoError(t, err)
 
-	ruleB, err := attestorCacheRule("verify-rule", iv, newCtx("builder-B"))
+	ruleB, err := attestorCacheRule("verify-rule", iv, newCtx("builder-B"), declared)
 	assert.NoError(t, err)
 
 	assert.NotEqual(t, ruleA, ruleB, "rotating ConfigMap value in condition must change cache rule")
 
-	ruleARepeat, err := attestorCacheRule("verify-rule", iv, newCtx("builder-A"))
+	ruleARepeat, err := attestorCacheRule("verify-rule", iv, newCtx("builder-A"), declared)
 	assert.NoError(t, err)
 	assert.Equal(t, ruleA, ruleARepeat, "identical condition variable value must produce identical cache rule")
-	assert.Equal(t, "{{ builder.id }}", substituteContextVariablesInString("{{ builder.id }}", newCtx("builder-A")))
+	assert.Equal(t, "{{ builder.id }}", substituteContextVariablesInString("{{ builder.id }}", newCtx("builder-A"), nil, declared))
 }
 
 func Test_attestorCacheRule_BindsDenyConditionVariables(t *testing.T) {
@@ -332,12 +333,13 @@ func Test_attestorCacheRule_BindsDenyConditionVariables(t *testing.T) {
 		}},
 	})
 
-	ruleA, err := attestorCacheRule("verify-rule", iv, ctx)
+	declared := map[string]bool{"cm": true}
+	ruleA, err := attestorCacheRule("verify-rule", iv, ctx, declared)
 	assert.NoError(t, err)
 
 	rotated := enginecontext.NewContext(jp)
 	_ = rotated.AddVariable("cm.data.allowed", "B")
-	ruleB, err := attestorCacheRule("verify-rule", iv, rotated)
+	ruleB, err := attestorCacheRule("verify-rule", iv, rotated, declared)
 	assert.NoError(t, err)
 	assert.NotEqual(t, ruleA, ruleB, "rotating ConfigMap in deny conditions must produce different cache rule")
 }
@@ -369,10 +371,11 @@ func Test_attestorCacheRule_PreservesConditionType(t *testing.T) {
 		},
 	}
 
-	ruleNum, err := attestorCacheRule("verify-rule", iv, ctxNum)
+	declared := map[string]bool{"cm": true}
+	ruleNum, err := attestorCacheRule("verify-rule", iv, ctxNum, declared)
 	assert.NoError(t, err)
 
-	ruleStr, err := attestorCacheRule("verify-rule", iv, ctxStr)
+	ruleStr, err := attestorCacheRule("verify-rule", iv, ctxStr, declared)
 	assert.NoError(t, err)
 
 	assert.NotEqual(t, ruleNum, ruleStr, "numeric 1 and string '1' must produce distinct cache rules")
@@ -539,7 +542,7 @@ func Test_hasUnresolvedConditionVariables(t *testing.T) {
 	}
 	assert.True(t, hasUnresolvedConditionVariables(unresolvedIV, ctx))
 
-	// 2. Condition with all variables resolved by context -> false
+	// 2. Condition with all variables resolved by declared context -> false
 	resolvedIV := &kyvernov1.ImageVerification{
 		Attestations: []kyvernov1.Attestation{
 			{
@@ -558,7 +561,53 @@ func Test_hasUnresolvedConditionVariables(t *testing.T) {
 			},
 		},
 	}
-	assert.False(t, hasUnresolvedConditionVariables(resolvedIV, ctx))
+	assert.False(t, hasUnresolvedConditionVariables(resolvedIV, ctx, map[string]bool{"cm": true}))
+	assert.True(t, hasUnresolvedConditionVariables(resolvedIV, ctx), "without declared context entry, cm.data.builder must remain unresolved")
+
+	// 2b. Condition with statement field containing .data. or request.* must not be treated as outer context
+	ctxWithBuildData := enginecontext.NewContext(jp)
+	_ = ctxWithBuildData.AddVariable("build.data.version", "v1.0.0")
+	buildDataIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ build.data.version }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"v1.0.0"`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, hasUnresolvedConditionVariables(buildDataIV, ctxWithBuildData), "build.data.version must remain unresolved when build is not in declared context")
+
+	ctxWithRequest := enginecontext.NewContext(jp)
+	_ = ctxWithRequest.AddVariable("request.operation", "CREATE")
+	requestIV := &kyvernov1.ImageVerification{
+		Attestations: []kyvernov1.Attestation{
+			{
+				PredicateType: "https://slsa.dev/provenance/v0.2",
+				Conditions: []kyvernov1.AnyAllConditions{
+					{
+						AllConditions: []kyvernov1.Condition{
+							{
+								RawKey:   &apiextv1.JSON{Raw: []byte(`"{{ request.operation }}"`)},
+								Operator: "Equals",
+								RawValue: &apiextv1.JSON{Raw: []byte(`"CREATE"`)},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, hasUnresolvedConditionVariables(requestIV, ctxWithRequest), "request.operation must remain statement-scoped and unresolved when request is not in declared context")
 
 	// 3. Attestation with no conditions -> false
 	noCondIV := &kyvernov1.ImageVerification{
@@ -946,4 +995,114 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8nXRh950IZbRj8Ra/N9sbqOPZrfM
 			}
 		})
 	}
+}
+
+func Test_ImageVerifier_StaticAuthorityAnnotationFastPath(t *testing.T) {
+	const inlineKey = `-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8nXRh950IZbRj8Ra/N9sbqOPZrfM
+5/KAQN0/KjHcorm/J5yctVd7iEcnessRQjU917hmKO6JWVGHpDguIyakZA==
+-----END PUBLIC KEY-----`
+
+	cfg := config.NewDefaultConfiguration(false)
+	jp := jmespath.New(cfg)
+
+	// Old resource has image verification pass annotation
+	oldRes := unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Pod",
+			"metadata": map[string]any{
+				"name":      "test-pod",
+				"namespace": "default",
+				"annotations": map[string]any{
+					"kyverno.io/verify-images-scoped": `{"version":1,"policies":{"/test-policy":{"test-rule":{"docker.io/library/nginx:latest":"pass"}}}}`,
+				},
+			},
+			"spec": map[string]any{
+				"containers": []any{
+					map[string]any{
+						"name":  "nginx",
+						"image": "docker.io/library/nginx:latest",
+					},
+				},
+			},
+		},
+	}
+	newRes := *oldRes.DeepCopy()
+
+	policy := &kyvernov1.ClusterPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-policy",
+		},
+	}
+	policyCtx, err := policycontext.NewPolicyContext(jp, newRes, kyvernov1.Update, nil, cfg)
+	assert.NoError(t, err)
+	policyCtx = policyCtx.WithPolicy(policy).WithOldResource(oldRes)
+	assert.NoError(t, policyCtx.JSONContext().AddResource(newRes.Object))
+	assert.NoError(t, policyCtx.JSONContext().AddOldResource(oldRes.Object))
+
+	imageInfo := apiutils.ImageInfo{
+		Registry: "docker.io",
+		Name:     "nginx",
+		Path:     "library/nginx",
+		Tag:      "latest",
+		Pointer:  "/spec/containers/0/image",
+	}
+
+	staticIV := kyvernov1.ImageVerification{
+		UseCache:        true,
+		ImageReferences: []string{"*"},
+		Attestors: []kyvernov1.AttestorSet{
+			{
+				Entries: []kyvernov1.Attestor{
+					{
+						Keys: &kyvernov1.StaticKeyAttestor{
+							PublicKeys: inlineKey,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// 1. Static authority with unchanged image: annotation fast path used, zero Get calls
+	fakeCache := &recordingCacheClient{}
+	ivStatic := &imageVerifier{
+		logger:        logr.Discard(),
+		rclient:       adapters.RegistryClient(registryclient.New()),
+		ivCache:       fakeCache,
+		policyContext: policyCtx,
+		rule:          kyvernov1.Rule{Name: "test-rule"},
+		ivm:           &engineapi.ImageVerificationMetadata{},
+	}
+	patches, responses := ivStatic.verifyMatchedImage(context.Background(), staticIV, imageInfo, cfg)
+	assert.Equal(t, 0, fakeCache.getCalled, "static authority should take annotation fast path without cache Get")
+	assert.Empty(t, responses)
+	assert.Empty(t, patches)
+
+	// 2. Dynamic authority (rule has context): fast path bypassed, cache Get is called
+	fakeCacheDynamic := &recordingCacheClient{returnHit: true}
+	ivDynamic := &imageVerifier{
+		logger:        logr.Discard(),
+		rclient:       adapters.RegistryClient(registryclient.New()),
+		ivCache:       fakeCacheDynamic,
+		policyContext: policyCtx,
+		origRule: kyvernov1.Rule{
+			Name: "test-rule",
+			Context: []kyvernov1.ContextEntry{
+				{Name: "keys"},
+			},
+		},
+		rule: kyvernov1.Rule{
+			Name: "test-rule",
+			Context: []kyvernov1.ContextEntry{
+				{Name: "keys"},
+			},
+		},
+		ivm: &engineapi.ImageVerificationMetadata{},
+	}
+	_, responsesDynamic := ivDynamic.verifyMatchedImage(context.Background(), staticIV, imageInfo, cfg)
+	assert.Equal(t, 1, fakeCacheDynamic.getCalled, "dynamic authority must bypass annotation fast path and consult cache")
+	assert.NotEmpty(t, responsesDynamic)
+	assert.Equal(t, engineapi.RuleStatusPass, responsesDynamic[0].Status())
 }
