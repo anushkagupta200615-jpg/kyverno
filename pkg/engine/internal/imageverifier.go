@@ -686,8 +686,6 @@ func (iv *imageVerifier) checkAttestations(a kyvernov1.Attestation, s map[string
 	if len(a.Conditions) == 0 {
 		return true, "", nil
 	}
-	iv.policyContext.JSONContext().Checkpoint()
-	defer iv.policyContext.JSONContext().Restore()
 	return EvaluateConditions(a.Conditions, iv.policyContext.JSONContext(), s, iv.logger)
 }
 
