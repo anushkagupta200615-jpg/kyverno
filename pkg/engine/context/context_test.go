@@ -462,7 +462,6 @@ func Test_ContextSizeLimitBlocksExponentialAmplification(t *testing.T) {
 	assert.LessOrEqual(t, sizeErr.Limit, int64(testLimit))
 }
 
-
 func Test_ContextSizeLimitCheckpointRestore(t *testing.T) {
 	ctx := &context{
 		jp:             jp,
@@ -497,8 +496,8 @@ type mockEntryLoader struct {
 	hasLoaded bool
 }
 
-func (l *mockEntryLoader) Name() string        { return l.name }
-func (l *mockEntryLoader) HasLoaded() bool    { return l.hasLoaded }
+func (l *mockEntryLoader) Name() string    { return l.name }
+func (l *mockEntryLoader) HasLoaded() bool { return l.hasLoaded }
 func (l *mockEntryLoader) LoadData() error {
 	l.hasLoaded = true
 	return l.ctx.AddContextEntry(l.name, l.data)

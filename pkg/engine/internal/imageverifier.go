@@ -148,15 +148,8 @@ func (iv *imageVerifier) verifyMatchedImage(
 		iv.logger.V(2).Info("cache entry found", "namespace", iv.policyContext.Policy().GetNamespace(), "policy", iv.policyContext.Policy().GetName(), "ruleName", iv.rule.Name, "imageRef", image)
 		digest = imageInfo.Digest
 		if iv.rule.HasValidateImageVerification() {
-			var validateErr error
-			for _, ivEntry := range iv.rule.VerifyImages {
-				if err := iv.validate(ivEntry, ctx); err != nil {
-					validateErr = err
-					break
-				}
-			}
-			if validateErr != nil {
-				msg := fmt.Sprintf("validation in verifyImages failed: %v", validateErr)
+			if err := iv.evaluateRuleValidation(ctx); err != nil {
+				msg := fmt.Sprintf("validation in verifyImages failed: %v", err)
 				ruleResp = engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties)
 			} else {
 				ruleResp = engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, "verified from cache", iv.rule.ReportProperties)
@@ -269,6 +262,15 @@ func (iv *imageVerifier) verifyImage(
 			imageInfo.Digest = cosignResp.Digest
 		}
 		if len(imageVerify.Attestations) == 0 {
+			if iv.rule.HasValidateImageVerification() {
+				if err := iv.evaluateRuleValidation(ctx); err != nil {
+					msg := fmt.Sprintf("validation in verifyImages failed: %v", err)
+					iv.logger.Error(err, "validation in verifyImages failed")
+					return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties), cosignResp.Digest
+				}
+				msg := fmt.Sprintf("verifyImages validation is passed in %v rule", iv.rule.Name)
+				return engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties), cosignResp.Digest
+			}
 			return ruleResp, cosignResp.Digest
 		}
 	}
@@ -403,12 +405,10 @@ func (iv *imageVerifier) verifyAttestations(
 	}
 
 	if iv.rule.HasValidateImageVerification() {
-		for _, imageVerify := range iv.rule.VerifyImages {
-			if err := iv.validate(imageVerify, ctx); err != nil {
-				msg := fmt.Sprintf("validation in verifyImages failed: %v", err)
-				iv.logger.Error(err, "validation in verifyImages failed")
-				return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties), imageInfo.Digest
-			}
+		if err := iv.evaluateRuleValidation(ctx); err != nil {
+			msg := fmt.Sprintf("validation in verifyImages failed: %v", err)
+			iv.logger.Error(err, "validation in verifyImages failed")
+			return engineapi.RuleFail(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties), imageInfo.Digest
 		}
 		msg := fmt.Sprintf("verifyImages validation is passed in %v rule", iv.rule.Name)
 		return engineapi.RulePass(iv.rule.Name, engineapi.ImageVerify, msg, iv.rule.ReportProperties), imageInfo.Digest
@@ -703,6 +703,18 @@ func (iv *imageVerifier) handleMutateDigest(ctx context.Context, digest string, 
 	patch := makeAddDigestPatch(imageInfo, digest)
 	iv.logger.V(4).Info("adding digest patch", "image", imageInfo.String(), "patch", patch.Json())
 	return &patch, digest, nil
+}
+
+func (iv *imageVerifier) evaluateRuleValidation(ctx context.Context) error {
+	if !iv.rule.HasValidateImageVerification() {
+		return nil
+	}
+	for _, imageVerify := range iv.rule.VerifyImages {
+		if err := iv.validate(imageVerify, ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (iv *imageVerifier) validate(imageVerify kyvernov1.ImageVerification, ctx context.Context) error {
